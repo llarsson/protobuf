@@ -231,6 +231,7 @@ func (g *grpc) generateService(file *generator.FileDescriptor, service *pb.Servi
 		g.P(deprecationComment)
 	}
 	g.generateUnimplementedServer(servName, service)
+	g.generateCachingProxy(servName, service)
 
 	// Server registration.
 	if deprecated {
@@ -311,6 +312,65 @@ func (g *grpc) generateServerMethodConcrete(servName string, method *pb.MethodDe
 	statusPkg := string(g.gen.AddImport(statusPkgPath))
 	codePkg := string(g.gen.AddImport(codePkgPath))
 	g.P("return ", nilArg, statusPkg, `.Errorf(`, codePkg, `.Unimplemented, "method `, methName, ` not implemented")`)
+	g.P("}")
+}
+
+// generateCachingProxy creates the caching proxy struct
+func (g *grpc) generateCachingProxy(servName string, service *pb.ServiceDescriptorProto) {
+	serverType := servName + "CachingProxy"
+	g.P("// ", serverType, " creates a caching proxy for the service.")
+	g.P("type ", serverType, " struct {")
+	g.P("client ", servName, "Client")
+	g.P("}")
+	g.P()
+	// Unimplemented<service_name>Server's concrete methods
+	for _, method := range service.Method {
+		g.generateCachingProxyMethodConcrete(servName, service, method)
+	}
+	g.P()
+}
+
+// generateCachingProxyMethodConcrete returns methods for the caching proxy implementation
+func (g *grpc) generateCachingProxyMethodConcrete(servName string, service *pb.ServiceDescriptorProto, method *pb.MethodDescriptorProto) {
+	header := g.generateServerSignatureWithParamNames(servName, method)
+	g.P("func (p *", servName, "CachingProxy) ", header, " {")
+	methName := generator.CamelCase(method.GetName())
+
+	if method.GetServerStreaming() || method.GetClientStreaming() {
+		statusPkg := string(g.gen.AddImport(statusPkgPath))
+		codePkg := string(g.gen.AddImport(codePkgPath))
+		g.P("return ", statusPkg, `.Errorf(`, codePkg, `.Unimplemented, "Streaming support required for method `, methName, ` not implemented")`)
+	}
+
+	g.P(`ctx, span := trace.StartSpan(ctx, "`, service.GetName(), "CachingProxy.", method.GetName(), `")`)
+	g.P(`defer span.End()`)
+	g.P(``)
+	g.P(`hash := hashcode.Strings([]string{"`, servName, ".", method.GetName(), `", `, `req.String()})`)
+	g.P(``)
+	g.P(`if value, found := responseCache.Get(hash); found {`)
+	g.P(`	cachedResponse := value.(*`, g.typeName(method.GetOutputType()), `)`)
+	g.P(`	grpc.SendHeader(ctx, metadata.Pairs("x-cache", "hit"))`)
+	g.P(`	log.Printf("Using cached response for call to `, service.GetName(), ".", method.GetName(), `(%s)", req)`)
+	g.P(`	return cachedResponse, nil`)
+	g.P(`} else {`)
+	g.P(`	var header metadata.MD`)
+	g.P(`	response, err := p.client.`, method.GetName(), `(ctx, req, grpc.Header(&header))`)
+	g.P(`	if err != nil {`)
+	g.P(`		log.Printf("Failed to call upstream `, service.GetName(), ".", method.GetName(), `")`)
+	g.P(`		span.SetStatus(trace.Status{Code: trace.StatusCodeInternal, Message: err.Error()})`)
+	g.P(`		return nil, err`)
+	g.P(`	}`)
+	g.P(``)
+	g.P(`	expiration, err := cacheExpiration(header.Get("cache-control"))`)
+	g.P(`	if expiration > 0 {`)
+	g.P(`		responseCache.Set(hash, response, time.Duration(expiration)*time.Second)`)
+	g.P(`		log.Printf("Storing response for %d seconds", expiration)`)
+	g.P(`	}`)
+	g.P(``)
+	g.P(`	grpc.SendHeader(ctx, metadata.Pairs("x-cache", "miss"))`)
+	g.P(`	log.Printf("Fetched upstream response for call to `, service.GetName(), ".", method.GetName(), `(%s)", req)`)
+	g.P(`	return response, nil`)
+	g.P(`}`)
 	g.P("}")
 }
 
