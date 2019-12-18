@@ -52,10 +52,18 @@ const generatedCodeVersion = 4
 // Paths for packages used by code generated in this file,
 // relative to the import_prefix of the generator.Generator.
 const (
-	contextPkgPath = "context"
-	grpcPkgPath    = "google.golang.org/grpc"
-	codePkgPath    = "google.golang.org/grpc/codes"
-	statusPkgPath  = "google.golang.org/grpc/status"
+	contextPkgPath  = "context"
+	grpcPkgPath     = "google.golang.org/grpc"
+	codePkgPath     = "google.golang.org/grpc/codes"
+	statusPkgPath   = "google.golang.org/grpc/status"
+	hashcodePkgPath = "github.com/hashicorp/terraform/helper/hashcode"
+	cachePkgPath    = "github.com/patrickmn/go-cache"
+	tracePkgPath    = "go.opencensus.io/trace"
+	logPkgPath      = "log"
+	metadataPkgPath = "google.golang.org/grpc/metadata"
+	timePkgPath     = "time"
+	stringsPkgPath  = "strings"
+	strconvPkgPath  = "strconv"
 )
 
 func init() {
@@ -124,6 +132,9 @@ func (g *grpc) Generate(file *generator.FileDescriptor) {
 	for i, service := range file.FileDescriptorProto.Service {
 		g.generateService(file, service, i)
 	}
+
+	// cache expiration calculation helper method
+	g.generateCacheExpirationMethod()
 }
 
 // GenerateImports generates the import declaration for this file.
@@ -231,6 +242,8 @@ func (g *grpc) generateService(file *generator.FileDescriptor, service *pb.Servi
 		g.P(deprecationComment)
 	}
 	g.generateUnimplementedServer(servName, service)
+
+	// Caching proxy support
 	g.generateCachingProxy(servName, service)
 
 	// Server registration.
@@ -315,12 +328,34 @@ func (g *grpc) generateServerMethodConcrete(servName string, method *pb.MethodDe
 	g.P("}")
 }
 
+func (g *grpc) generateCacheExpirationMethod() {
+	statusPkg := string(g.gen.AddImport(statusPkgPath))
+	codePkg := string(g.gen.AddImport(codePkgPath))
+	stringsPkg := string(g.gen.AddImport(stringsPkgPath))
+	strconvPkg := string(g.gen.AddImport(strconvPkgPath))
+	g.P(`func cacheExpiration(cacheHeaders []string) (int, error) {`)
+	g.P(`	for _, header := range cacheHeaders {`)
+	g.P(`		for _, value := range `, stringsPkg, `.Split(header, ",") {`)
+	g.P(`			value = `, stringsPkg, `.Trim(value, " ")`)
+	g.P(`			if `, stringsPkg, `.HasPrefix(value, "max-age") {`)
+	g.P(`				duration := `, stringsPkg, `.Split(value, "max-age=")[1]`)
+	g.P(`				return `, strconvPkg, `.Atoi(duration)`)
+	g.P(`			}`)
+	g.P(`		}`)
+	g.P(`	}`)
+	g.P(`	return -1, `, statusPkg, `.Errorf(`, codePkg, `.Internal, "No cache expiration set for the given object")`)
+	g.P(`}`)
+}
+
 // generateCachingProxy creates the caching proxy struct
 func (g *grpc) generateCachingProxy(servName string, service *pb.ServiceDescriptorProto) {
+	cachePkg := string(g.gen.AddImport(cachePkgPath))
+
 	serverType := servName + "CachingProxy"
 	g.P("// ", serverType, " creates a caching proxy for the service.")
 	g.P("type ", serverType, " struct {")
-	g.P("client ", servName, "Client")
+	g.P("Client ", servName, "Client")
+	g.P("Cache ", cachePkg, ".Cache")
 	g.P("}")
 	g.P()
 	// Unimplemented<service_name>Server's concrete methods
@@ -342,33 +377,39 @@ func (g *grpc) generateCachingProxyMethodConcrete(servName string, service *pb.S
 		g.P("return ", statusPkg, `.Errorf(`, codePkg, `.Unimplemented, "Streaming support required for method `, methName, ` not implemented")`)
 	}
 
-	g.P(`ctx, span := trace.StartSpan(ctx, "`, service.GetName(), "CachingProxy.", method.GetName(), `")`)
+	tracePkg := string(g.gen.AddImport(tracePkgPath))
+	hashcodePkg := string(g.gen.AddImport(hashcodePkgPath))
+	logPkg := string(g.gen.AddImport(logPkgPath))
+	metadataPkg := string(g.gen.AddImport(metadataPkgPath))
+	timePkg := string(g.gen.AddImport(timePkgPath))
+
+	g.P(`ctx, span := `, tracePkg, `.StartSpan(ctx, "`, service.GetName(), "CachingProxy.", method.GetName(), `")`)
 	g.P(`defer span.End()`)
 	g.P(``)
-	g.P(`hash := hashcode.Strings([]string{"`, servName, ".", method.GetName(), `", `, `req.String()})`)
+	g.P(`hash := `, hashcodePkg, `.Strings([]string{"`, servName, ".", method.GetName(), `", `, `req.String()})`)
 	g.P(``)
-	g.P(`if value, found := responseCache.Get(hash); found {`)
+	g.P(`if value, found := p.Cache.Get(hash); found {`)
 	g.P(`	cachedResponse := value.(*`, g.typeName(method.GetOutputType()), `)`)
-	g.P(`	grpc.SendHeader(ctx, metadata.Pairs("x-cache", "hit"))`)
-	g.P(`	log.Printf("Using cached response for call to `, service.GetName(), ".", method.GetName(), `(%s)", req)`)
+	g.P(`	grpc.SendHeader(ctx, `, metadataPkg, `.Pairs("x-cache", "hit"))`)
+	g.P(`	`, logPkg, `.Printf("Using cached response for call to `, service.GetName(), ".", method.GetName(), `(%s)", req)`)
 	g.P(`	return cachedResponse, nil`)
 	g.P(`} else {`)
-	g.P(`	var header metadata.MD`)
-	g.P(`	response, err := p.client.`, method.GetName(), `(ctx, req, grpc.Header(&header))`)
+	g.P(`	var header `, metadataPkg, `.MD`)
+	g.P(`	response, err := p.Client.`, method.GetName(), `(ctx, req, grpc.Header(&header))`)
 	g.P(`	if err != nil {`)
-	g.P(`		log.Printf("Failed to call upstream `, service.GetName(), ".", method.GetName(), `")`)
-	g.P(`		span.SetStatus(trace.Status{Code: trace.StatusCodeInternal, Message: err.Error()})`)
+	g.P(`		`, logPkg, `.Printf("Failed to call upstream `, service.GetName(), ".", method.GetName(), `")`)
+	g.P(`		span.SetStatus(trace.Status{Code: `, tracePkg, `.StatusCodeInternal, Message: err.Error()})`)
 	g.P(`		return nil, err`)
 	g.P(`	}`)
 	g.P(``)
 	g.P(`	expiration, err := cacheExpiration(header.Get("cache-control"))`)
 	g.P(`	if expiration > 0 {`)
-	g.P(`		responseCache.Set(hash, response, time.Duration(expiration)*time.Second)`)
-	g.P(`		log.Printf("Storing response for %d seconds", expiration)`)
+	g.P(`		p.Cache.Set(hash, response, `, timePkg, `.Duration(expiration)*`, timePkg, `.Second)`)
+	g.P(`		`, logPkg, `.Printf("Storing response for %d seconds", expiration)`)
 	g.P(`	}`)
 	g.P(``)
-	g.P(`	grpc.SendHeader(ctx, metadata.Pairs("x-cache", "miss"))`)
-	g.P(`	log.Printf("Fetched upstream response for call to `, service.GetName(), ".", method.GetName(), `(%s)", req)`)
+	g.P(`	grpc.SendHeader(ctx, `, metadataPkg, `.Pairs("x-cache", "miss"))`)
+	g.P(`	`, logPkg, `.Printf("Fetched upstream response for call to `, service.GetName(), ".", method.GetName(), `(%s)", req)`)
 	g.P(`	return response, nil`)
 	g.P(`}`)
 	g.P("}")
