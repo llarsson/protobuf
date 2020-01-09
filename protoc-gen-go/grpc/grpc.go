@@ -246,6 +246,9 @@ func (g *grpc) generateService(file *generator.FileDescriptor, service *pb.Servi
 	// Caching proxy support
 	g.generateCachingProxy(servName, service)
 
+	// Generate proxy support
+	g.generateProxy(servName, service)
+
 	// Server registration.
 	if deprecated {
 		g.P(deprecationComment)
@@ -345,6 +348,50 @@ func (g *grpc) generateCacheExpirationMethod() {
 	g.P(`	}`)
 	g.P(`	return -1, `, statusPkg, `.Errorf(`, codePkg, `.Internal, "No cache expiration set for the given object")`)
 	g.P(`}`)
+}
+
+// generateProxy Generates a unary proxy
+func (g *grpc) generateProxy(servName string, service *pb.ServiceDescriptorProto) {
+	serverType := servName + "Proxy"
+	g.P("// ", serverType, " creates a proxy for the")
+	g.P("type ", serverType, " struct {")
+	g.P("Client ", servName, "Client")
+	g.P("}")
+	g.P()
+	// Unimplemented<service_name>Server's concrete methods
+	for _, method := range service.Method {
+		g.generateProxyMethodConcrete(servName, service, method)
+	}
+	g.P()
+}
+
+// generateProxyMethodConcrete returns methods for the unary proxy implementation
+func (g *grpc) generateProxyMethodConcrete(servName string, service *pb.ServiceDescriptorProto, method *pb.MethodDescriptorProto) {
+	header := g.generateServerSignatureWithParamNames(servName, method)
+	g.P("func (p *", servName, "Proxy) ", header, " {")
+	methName := generator.CamelCase(method.GetName())
+
+	if method.GetServerStreaming() || method.GetClientStreaming() {
+		statusPkg := string(g.gen.AddImport(statusPkgPath))
+		codePkg := string(g.gen.AddImport(codePkgPath))
+		g.P("return ", statusPkg, `.Errorf(`, codePkg, `.Unimplemented, "Streaming support required for method `, methName, ` not implemented")`)
+	}
+
+	tracePkg := string(g.gen.AddImport(tracePkgPath))
+	logPkg := string(g.gen.AddImport(logPkgPath))
+
+	g.P(`ctx, span := `, tracePkg, `.StartSpan(ctx, "`, service.GetName(), "Proxy.", method.GetName(), `")`)
+	g.P(`defer span.End()`)
+	g.P(`response, err := p.Client.`, method.GetName(), `(ctx, req)`)
+	g.P(`if err != nil {`)
+	g.P(`	`, logPkg, `.Printf("Failed to call upstream `, service.GetName(), ".", method.GetName(), `")`)
+	g.P(`	span.SetStatus(`, tracePkg, `.Status{Code: `, tracePkg, `.StatusCodeInternal, Message: err.Error()})`)
+	g.P(`	return nil, err`)
+	g.P(`}`)
+	g.P(``)
+	g.P(`return response, nil`)
+	g.P(`}`)
+	g.P("")
 }
 
 // generateCachingProxy creates the caching proxy struct
