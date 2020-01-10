@@ -132,9 +132,6 @@ func (g *grpc) Generate(file *generator.FileDescriptor) {
 	for i, service := range file.FileDescriptorProto.Service {
 		g.generateService(file, service, i)
 	}
-
-	// cache expiration calculation helper method
-	g.generateCacheExpirationMethod()
 }
 
 // GenerateImports generates the import declaration for this file.
@@ -243,9 +240,6 @@ func (g *grpc) generateService(file *generator.FileDescriptor, service *pb.Servi
 	}
 	g.generateUnimplementedServer(servName, service)
 
-	// Caching proxy support
-	g.generateCachingProxy(servName, service)
-
 	// Generate proxy support
 	g.generateProxy(servName, service)
 
@@ -331,25 +325,6 @@ func (g *grpc) generateServerMethodConcrete(servName string, method *pb.MethodDe
 	g.P("}")
 }
 
-func (g *grpc) generateCacheExpirationMethod() {
-	statusPkg := string(g.gen.AddImport(statusPkgPath))
-	codePkg := string(g.gen.AddImport(codePkgPath))
-	stringsPkg := string(g.gen.AddImport(stringsPkgPath))
-	strconvPkg := string(g.gen.AddImport(strconvPkgPath))
-	g.P(`func cacheExpiration(cacheHeaders []string) (int, error) {`)
-	g.P(`	for _, header := range cacheHeaders {`)
-	g.P(`		for _, value := range `, stringsPkg, `.Split(header, ",") {`)
-	g.P(`			value = `, stringsPkg, `.Trim(value, " ")`)
-	g.P(`			if `, stringsPkg, `.HasPrefix(value, "max-age") {`)
-	g.P(`				duration := `, stringsPkg, `.Split(value, "max-age=")[1]`)
-	g.P(`				return `, strconvPkg, `.Atoi(duration)`)
-	g.P(`			}`)
-	g.P(`		}`)
-	g.P(`	}`)
-	g.P(`	return -1, `, statusPkg, `.Errorf(`, codePkg, `.Internal, "No cache expiration set for the given object")`)
-	g.P(`}`)
-}
-
 // generateProxy Generates a unary proxy
 func (g *grpc) generateProxy(servName string, service *pb.ServiceDescriptorProto) {
 	serverType := servName + "Proxy"
@@ -392,74 +367,6 @@ func (g *grpc) generateProxyMethodConcrete(servName string, service *pb.ServiceD
 	g.P(`return response, nil`)
 	g.P(`}`)
 	g.P("")
-}
-
-// generateCachingProxy creates the caching proxy struct
-func (g *grpc) generateCachingProxy(servName string, service *pb.ServiceDescriptorProto) {
-	cachePkg := string(g.gen.AddImport(cachePkgPath))
-
-	serverType := servName + "CachingProxy"
-	g.P("// ", serverType, " creates a caching proxy for the service.")
-	g.P("type ", serverType, " struct {")
-	g.P("Client ", servName, "Client")
-	g.P("Cache ", cachePkg, ".Cache")
-	g.P("}")
-	g.P()
-	// Unimplemented<service_name>Server's concrete methods
-	for _, method := range service.Method {
-		g.generateCachingProxyMethodConcrete(servName, service, method)
-	}
-	g.P()
-}
-
-// generateCachingProxyMethodConcrete returns methods for the caching proxy implementation
-func (g *grpc) generateCachingProxyMethodConcrete(servName string, service *pb.ServiceDescriptorProto, method *pb.MethodDescriptorProto) {
-	header := g.generateServerSignatureWithParamNames(servName, method)
-	g.P("func (p *", servName, "CachingProxy) ", header, " {")
-	methName := generator.CamelCase(method.GetName())
-
-	if method.GetServerStreaming() || method.GetClientStreaming() {
-		statusPkg := string(g.gen.AddImport(statusPkgPath))
-		codePkg := string(g.gen.AddImport(codePkgPath))
-		g.P("return ", statusPkg, `.Errorf(`, codePkg, `.Unimplemented, "Streaming support required for method `, methName, ` not implemented")`)
-	}
-
-	tracePkg := string(g.gen.AddImport(tracePkgPath))
-	hashcodePkg := string(g.gen.AddImport(hashcodePkgPath))
-	logPkg := string(g.gen.AddImport(logPkgPath))
-	metadataPkg := string(g.gen.AddImport(metadataPkgPath))
-	timePkg := string(g.gen.AddImport(timePkgPath))
-
-	g.P(`ctx, span := `, tracePkg, `.StartSpan(ctx, "`, service.GetName(), "CachingProxy.", method.GetName(), `")`)
-	g.P(`defer span.End()`)
-	g.P(``)
-	g.P(`hash := `, hashcodePkg, `.Strings([]string{"`, servName, ".", method.GetName(), `", `, `req.String()})`)
-	g.P(``)
-	g.P(`if value, found := p.Cache.Get(hash); found {`)
-	g.P(`	cachedResponse := value.(*`, g.typeName(method.GetOutputType()), `)`)
-	g.P(`	grpc.SendHeader(ctx, `, metadataPkg, `.Pairs("x-cache", "hit"))`)
-	g.P(`	`, logPkg, `.Printf("Using cached response for call to `, service.GetName(), ".", method.GetName(), `(%s)", req)`)
-	g.P(`	return cachedResponse, nil`)
-	g.P(`} else {`)
-	g.P(`	var header `, metadataPkg, `.MD`)
-	g.P(`	response, err := p.Client.`, method.GetName(), `(ctx, req, grpc.Header(&header))`)
-	g.P(`	if err != nil {`)
-	g.P(`		`, logPkg, `.Printf("Failed to call upstream `, service.GetName(), ".", method.GetName(), `")`)
-	g.P(`		span.SetStatus(trace.Status{Code: `, tracePkg, `.StatusCodeInternal, Message: err.Error()})`)
-	g.P(`		return nil, err`)
-	g.P(`	}`)
-	g.P(``)
-	g.P(`	expiration, err := cacheExpiration(header.Get("cache-control"))`)
-	g.P(`	if expiration > 0 {`)
-	g.P(`		p.Cache.Set(hash, response, `, timePkg, `.Duration(expiration)*`, timePkg, `.Second)`)
-	g.P(`		`, logPkg, `.Printf("Storing response for %d seconds", expiration)`)
-	g.P(`	}`)
-	g.P(``)
-	g.P(`	grpc.SendHeader(ctx, `, metadataPkg, `.Pairs("x-cache", "miss"))`)
-	g.P(`	`, logPkg, `.Printf("Fetched upstream response for call to `, service.GetName(), ".", method.GetName(), `(%s)", req)`)
-	g.P(`	return response, nil`)
-	g.P(`}`)
-	g.P("}")
 }
 
 // generateClientSignature returns the client-side signature for a method.
