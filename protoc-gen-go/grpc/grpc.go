@@ -352,21 +352,17 @@ func (g *grpc) generateProxyMethodConcrete(servName string, service *pb.ServiceD
 		g.P("return ", statusPkg, `.Errorf(`, codePkg, `.Unimplemented, "Streaming support required for method `, methName, ` not implemented")`)
 	}
 
-	tracePkg := string(g.gen.AddImport(tracePkgPath))
 	logPkg := string(g.gen.AddImport(logPkgPath))
 
-	g.P(`ctx, span := `, tracePkg, `.StartSpan(ctx, "`, service.GetName(), "Proxy.", method.GetName(), `")`)
-	g.P(`defer span.End()`)
 	g.P(`response, err := p.Client.`, method.GetName(), `(ctx, req)`)
 	g.P(`if err != nil {`)
 	g.P(`	`, logPkg, `.Printf("Failed to call upstream `, service.GetName(), ".", method.GetName(), `")`)
-	g.P(`	span.SetStatus(`, tracePkg, `.Status{Code: `, tracePkg, `.StatusCodeInternal, Message: err.Error()})`)
 	g.P(`	return nil, err`)
 	g.P(`}`)
 	g.P(``)
 	g.P(`return response, nil`)
 	g.P(`}`)
-	g.P("")
+	g.P()
 }
 
 // generateClientSignature returns the client-side signature for a method.
