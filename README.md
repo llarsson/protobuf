@@ -1,3 +1,9 @@
+# Research version of the Protobuf compiler
+
+This version's Go output adds a reverse proxy implementation for each service. Used in "Towards soft circuit breaking in service meshes via application-agnostic caching". Just generate Go output, it'll be there -- no special instructions.
+
+Original README follows.
+
 # Go support for Protocol Buffers - Google's data interchange format
 
 [![Build Status](https://travis-ci.org/golang/protobuf.svg?branch=master)](https://travis-ci.org/golang/protobuf)
